@@ -17,9 +17,6 @@ you will need to enable fullscreen without X11 by other means.
 
 Known issues:
 
-    - Sometimes TILER space is 'leaked', usually because the target
-      program didn't shut down properly. This may need a fix on the
-      kernel side.
     - Debugging needs to be tidied up/removed
 
 This shim is licensed under a permissive ISC license.

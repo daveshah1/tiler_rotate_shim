@@ -18,10 +18,6 @@ you will need to enable fullscreen without X11 by other means.
 
 Known issues:
 
-	- Sometimes TILER space is 'leaked', usually because the target
-	  program didn't shut down properly. This may need a fix on the
-	  kernel side.
-
  	- Debugging needs to be tidied up/removed
 
 Copyright 2020 David Shah <dave@ds0.me>
@@ -44,7 +40,6 @@ PERFORMANCE OF THIS SOFTWARE.
 #include <dlfcn.h>
 #include <string.h>
 #include <fcntl.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -57,83 +52,9 @@ PERFORMANCE OF THIS SOFTWARE.
 #include <drm/omap_drm.h>
 
 int init_done = 0;
-int signal_init_done = 0;
 int debug_flag = 0;
 
-typedef void (*sighandler_t)(int);
-
 int  (*libc_ioctl)(int fd, unsigned long request, char *argp);
-sighandler_t (*libc_signal)(int sig, void (*func)(int));
-
-/*
-	Keep track of open buffers, so we can destroy them even
-	if the program terminates abnormally. This prevents 'leaks'
-	of TILER space that will otherwise cause subsequent allocations
-	to fail.
-*/
-#define MAX_BUFFERS 32
-
-struct buffer_list_item {
-	int fd;
-	int handle;
-};
-
-struct buffer_list_item open_buffers[MAX_BUFFERS];
-struct buffer_list_item open_framebuffers[MAX_BUFFERS];
-
-int handle_fd[MAX_BUFFERS];
-
-void add_buffer(int fd, int handle) {
-	for (int i = 0; i < MAX_BUFFERS; i++) {
-		if (open_buffers[i].fd != -1)
-			continue;
-		open_buffers[i].fd = fd;
-		open_buffers[i].handle = handle;
-		return;
-	}
-	printf("warning: no space to add buffer %d\n", handle);
-}
-
-
-void add_framebuffer(int fd, int handle) {
-	for (int i = 0; i < MAX_BUFFERS; i++) {
-		if (open_framebuffers[i].fd != -1)
-			continue;
-		open_framebuffers[i].fd = fd;
-		open_framebuffers[i].handle = handle;
-		return;
-	}
-	printf("warning: no space to add framebuffer %d\n", handle);
-}
-
-void add_handle_fd(int fd) {
-	for (int i = 0; i < MAX_BUFFERS; i++) {
-		if (handle_fd[i] == -1 || handle_fd[i] == fd) {
-			handle_fd[i] = fd;
-			return;
-		}
-	}
-}
-
-void remove_buffer(int handle) {
-	for (int i = 0; i < MAX_BUFFERS; i++) {
-		if (open_buffers[i].handle != handle)
-			continue;
-		open_buffers[i].fd = -1;
-		open_buffers[i].handle = -1;
-		return;
-	}
-}
-
-void remove_framebuffer(int handle) {
-	for (int i = 0; i < MAX_BUFFERS; i++) {
-		if (open_framebuffers[i].handle != handle)
-			continue;
-		open_framebuffers[i].fd = -1;
-		open_framebuffers[i].handle = -1;
-		return;
-	}
-}
 
 int test_flag(const char *name) {
 	const char *e = getenv(name);
@@ -142,119 +63,14 @@ int test_flag(const char *name) {
 	return atoi(e);
 }
 
-volatile sig_atomic_t cleanup_started = 0;
-
-
-__attribute__((destructor))
-void cleanup(void) {
-	if (cleanup_started)
-		return;
-	cleanup_started = 1;
-
-	for (int i = 0; i < MAX_BUFFERS; i++) {
-		if (handle_fd[i] == -1)
-			continue;
-		int ret = close(handle_fd[i]);
-		printf("cleanup close %d, ret=%d\n", handle_fd[i], ret);
-	}
-
-	for (int i = MAX_BUFFERS - 1; i >= 0; i--) {
-		if (open_framebuffers[i].fd == -1)
-			continue;
-		int ret = libc_ioctl(open_framebuffers[i].fd,
-			DRM_IOCTL_MODE_RMFB, (char *)&open_framebuffers[i].handle);
-		printf("cleanup remove %d %d, ret=%d\n", open_framebuffers[i].fd, open_framebuffers[i].handle, ret);
-		open_framebuffers[i].handle = -1;
-	}
-
-	for (int i = MAX_BUFFERS - 1; i >= 0; i--) {
-		if (open_buffers[i].fd == -1)
-			continue;
-		struct drm_mode_destroy_dumb destroy;
-		destroy.handle = open_buffers[i].handle;
-		int ret = libc_ioctl(open_buffers[i].fd,
-			DRM_IOCTL_MODE_DESTROY_DUMB, (char *) &destroy);
-		printf("cleanup destroy %d %d, ret=%d\n", open_buffers[i].fd, open_buffers[i].handle, ret);
-	}
-
-	for (int i = 0; i < 128; i++) {
-		close(i);
-	}
-}
-
-void signal_handler(int signum) {
-	printf("Cleaning up after signal %d!\n", signum);
-	/*
-		For some reason, exit is required here rather than
-		just calling our cleanup function and then throwing another
-		signal - some other cleanup must be being missed
-	*/
-	exit(1);
-}
-
-void register_handler(int signum) {
-	struct sigaction oldact;
-	sigaction(signum, NULL, &oldact);
-	if (oldact.sa_handler == SIG_DFL) {
-		// Make sure our handler is called instead of the default one
-		libc_signal(signum, signal_handler);
-	}
-}
-
-sighandler_t signal(int signum, sighandler_t handler) {
-	if (!signal_init_done)
-		libc_signal = dlsym(RTLD_NEXT, "signal");
-	signal_init_done = 1;
-	if (handler != SIG_DFL) {
-		return libc_signal(signum, handler);
-	}
-	// Make sure our handler is called instead of the default one
-	switch (signum) {
-		case SIGFPE:
-		case SIGILL:
-		case SIGSEGV:
-		case SIGBUS:
-		case SIGABRT:
-		case SIGSYS:
-		case SIGTERM:
-		case SIGINT:
-		case SIGQUIT:
-			return libc_signal(signum, signal_handler);
-		default:
-			return libc_signal(signum, handler);
-	}
-}
-
-
 void init(void) {
 	if (init_done)
 		return;
 
 	debug_flag = test_flag("ROTATE_DEBUG");
 	libc_ioctl = dlsym(RTLD_NEXT, "ioctl");
-	libc_signal = dlsym(RTLD_NEXT, "signal");
 
 	init_done = 1;
-	signal_init_done = 1;
-
-	for (int i = 0; i < MAX_BUFFERS; i++) {
-		open_buffers[i].fd = -1;
-		open_buffers[i].handle = -1;
-		open_framebuffers[i].fd = -1;
-		open_framebuffers[i].handle = -1;
-		handle_fd[i] = -1;
-	}
-
-	register_handler(SIGFPE);
-	register_handler(SIGILL);
-	register_handler(SIGSEGV);
-	register_handler(SIGBUS);
-	register_handler(SIGABRT);
-	register_handler(SIGSYS);
-	register_handler(SIGTERM);
-	register_handler(SIGINT);
-	register_handler(SIGQUIT);
-
 }
 
 int get_rotation_property_key(int fd, int plane) {
@@ -385,23 +201,7 @@ int ioctl(int fd, unsigned long request, char *argp) {
 					printf("rotate set for plane %d failed: %d %d\n", plane_id, a_result, errno);
 			}
 
-			add_buffer(fd, gem_new.handle);
 			return result;
-		}
-
-		if (request == DRM_IOCTL_MODE_DESTROY_DUMB) {
-			/*
-				Remove from the list of open buffers
-			*/
-			struct drm_mode_destroy_dumb *orig = (struct drm_mode_destroy_dumb*)argp;
-			printf("destroy %d %d\n", fd, orig->handle);
-			remove_buffer(orig->handle);
-		}
-
-		if (request == DRM_IOCTL_MODE_RMFB) {
-			int id = *((int *)argp);
-			printf("remove %d %d\n", fd, id);
-			remove_framebuffer(id);
 		}
 
 		if (request == DRM_IOCTL_MODE_SETCRTC) {
@@ -447,17 +247,6 @@ int ioctl(int fd, unsigned long request, char *argp) {
 		int temp = crtc->mode.hdisplay;
 		crtc->mode.hdisplay = crtc->mode.vdisplay;
 		crtc->mode.vdisplay = temp;
-	}
-
-	if (request == DRM_IOCTL_MODE_ADDFB) {
-		struct drm_mode_fb_cmd *cmd = (struct drm_mode_fb_cmd *)argp;
-		add_framebuffer(fd, cmd->fb_id);
-	}
-
-	if (request == DRM_IOCTL_PRIME_HANDLE_TO_FD) {
-		struct drm_prime_handle *orig = (struct drm_prime_handle *)argp;
-		add_handle_fd(orig->fd);
-		printf("add handle fd %d %d\n", orig->handle, orig->fd);
 	}
 
 	return result;
